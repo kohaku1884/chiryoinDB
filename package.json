@@ -1,0 +1,12 @@
+{
+  "name": "chiryoindb",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "整骨院 患者管理シート プロトタイプ",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "engines": { "node": ">=22.13" }
+}
