@@ -1,6 +1,6 @@
 // フロントエンド（依存なし）。計算値はすべてサーバーが返すため、画面上で数式を編集する手段は存在しない。
 const $app = document.getElementById('app');
-const ROLE = { admin: '本部', company_admin: '会社管理者', clinic_staff: '院担当者' };
+const ROLE = { admin: '運営（自社）', company_admin: '会社管理者', clinic_staff: '院担当者' };
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const yen = (n) => Number(n).toLocaleString('ja-JP');
 const curYm = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; };
@@ -91,8 +91,11 @@ function renderSheet() {
   main.querySelectorAll('button[data-state]').forEach((b) => b.onclick = async () => {
     try { await api('POST', `/api/records/${b.dataset.rec}/state`, { state: b.dataset.state }); await loadSheet(); } catch (e) { fail(e); }
   });
+  main.querySelectorAll('button[data-lock]').forEach((b) => b.onclick = async () => {
+    try { await api('POST', '/api/lock', { clinic_id: S.clinicId, ym: S.ym, locked: b.dataset.lock === '1' }); await loadSheet(); } catch (e) { fail(e); }
+  });
   const form = document.getElementById('add');
-  form.onsubmit = async (ev) => {
+  if (form) form.onsubmit = async (ev) => {
     ev.preventDefault();
     const body = { clinic_id: S.clinicId, ym: S.ym, name: form.name.value, birth: form.birth.value };
     try {
@@ -104,35 +107,40 @@ function renderSheet() {
 }
 
 function sheetHtml(sh) {
-  const head = `<th>ID</th><th>氏名</th><th>生年月日</th><th class="num">来院回数</th>
+  const head = `<th>ID</th><th>氏名</th><th>生年月日</th><th class="num">来院日数（当月）</th><th class="num">来院日数（累計）</th>
     ${sh.items.map((i) => `<th class="num">${esc(i.label)}</th>`).join('')}<th class="num">合計</th>`;
   const row = (r, existing) => {
     const ended = r.state === 'ended';
-    const cell = (extra, v) => ended ? `<td class="num">${v}</td>` : `<td class="num"><input type="number" min="0" ${extra} value="${v}"></td>`;
+    const ro = ended || sh.locked; // 終了済み・ロック中は入力不可
+    const cell = (extra, v) => ro ? `<td class="num">${v}</td>` : `<td class="num"><input type="number" min="0" ${extra} value="${v}"></td>`;
     return `<tr class="${ended ? 'ended' : ''}"><td>${esc(r.code)}</td><td>${esc(r.name)}</td><td>${esc(r.birth)}</td>
-      ${cell(`step="1" data-rec="${r.record_id}"`, r.visits)}
+      ${cell(`step="1" max="31" data-rec="${r.record_id}"`, r.visits)}
+      <td class="calc">${r.cumulative}</td>
       ${sh.items.map((i) => cell(`data-rec="${r.record_id}" data-item="${i.id}"`, r.vals[i.id])).join('')}
       <td class="calc">${yen(r.total)}</td>
       ${existing ? `<td><span class="tag ${r.state}">${{ pending: '未確認', confirmed: '継続', ended: '終了' }[r.state]}</span></td>
-        <td>${ended ? `<button class="ghost" data-rec="${r.record_id}" data-state="pending">終了を取消</button>`
+        <td>${sh.locked ? '' : ended ? `<button class="ghost" data-rec="${r.record_id}" data-state="pending">終了を取消</button>`
           : `${r.state === 'pending' ? `<button class="btn" data-rec="${r.record_id}" data-state="confirmed">継続</button> ` : ''}<button class="ghost danger" data-rec="${r.record_id}" data-state="ended">終了</button>`}</td>` : ''}
     </tr>`;
   };
-  const sumRow = (label, t, extraCols) => `<tr class="sum"><td colspan="3">${label}</td><td class="num">${t.visits}</td>
+  const sumRow = (label, t, extraCols) => `<tr class="sum"><td colspan="3">${label}</td><td class="num">${t.visits}</td><td class="num">${t.cumulative}</td>
     ${sh.items.map((i) => `<td class="num">${yen(t.vals[i.id])}</td>`).join('')}<td class="num"><b>${yen(t.total)}</b></td>${extraCols}</tr>`;
   const pendingCount = sh.existing.filter((r) => r.state === 'pending').length;
-  return `
+  const lockBar = sh.locked
+    ? `<div class="note">この月は編集ロック中です（月が終わって2か月経過）。${S.me.role === 'admin' ? `<button class="ghost" data-lock="0">ロックを解除</button>` : '修正が必要な場合は運営にご連絡ください。'}</div>`
+    : (S.me.role === 'admin' && sh.past ? `<div class="note">この月は運営によりロック解除中です。<button class="ghost" data-lock="1">再ロック</button></div>` : '');
+  return `${lockBar}
     <section class="card"><h2>新規患者（今月から通院）</h2><p class="sub">${esc(sh.clinic.name)} ／ ${esc(sh.ym)}</p>
       ${sh.new.length ? `<table><thead><tr>${head}</tr></thead><tbody>${sh.new.map((r) => row(r, false)).join('')}${sumRow('小計', sh.totals.new, '')}</tbody></table>` : '<div class="empty">新規患者はいません</div>'}
-      <form id="add" class="inline-form"><input name="name" placeholder="氏名" required maxlength="50"><input name="birth" type="date" title="生年月日">
-        <button class="btn">新規患者を追加</button></form>
+      ${sh.locked ? '' : `<form id="add" class="inline-form"><input name="name" placeholder="氏名" required maxlength="50"><input name="birth" type="date" title="生年月日">
+        <button class="btn">新規患者を追加</button></form>`}
     </section>
     <section class="card"><h2>既存患者（先月以前から継続）</h2>
-      <p class="sub">前月の内容をコピーして表示しています。通院を続けている患者は「継続」、通院をやめた患者は「終了」を押してください。</p>
+      <p class="sub">項目の値は前月の内容をコピーして表示しています（来院日数は毎月0から入力、累計は自動集計）。通院を続けている患者は「継続」、通院をやめた患者は「終了」を押してください。</p>
       ${pendingCount ? `<div class="note">未確認の患者が ${pendingCount} 名います</div>` : ''}
       ${sh.existing.length ? `<table><thead><tr>${head}<th>状態</th><th></th></tr></thead><tbody>${sh.existing.map((r) => row(r, true)).join('')}${sumRow('小計（終了を除く）', sh.totals.existing, '<td></td><td></td>')}</tbody></table>` : '<div class="empty">既存患者はいません</div>'}
     </section>
-    <section class="card"><h2>院合計</h2><table><thead><tr><th colspan="3"></th><th class="num">来院回数</th>${sh.items.map((i) => `<th class="num">${esc(i.label)}</th>`).join('')}<th class="num">合計</th></tr></thead>
+    <section class="card"><h2>院合計</h2><table><thead><tr><th colspan="3"></th><th class="num">来院日数（当月）</th><th class="num">来院日数（累計）</th>${sh.items.map((i) => `<th class="num">${esc(i.label)}</th>`).join('')}<th class="num">合計</th></tr></thead>
       <tbody>${sumRow('新規 + 既存（終了を除く）', sh.totals.all, '')}</tbody></table></section>`;
 }
 
@@ -164,7 +172,7 @@ function renderManage() {
       <table><thead><tr><th>メール</th><th>名前</th><th>権限</th><th>会社</th><th>院</th></tr></thead><tbody>
       ${m.users.map((u) => `<tr><td>${esc(u.email)}</td><td>${esc(u.name)}</td><td>${ROLE[u.role]}</td><td>${u.company_id ? coName(u.company_id) : '-'}</td><td>${u.clinic_id ? clName(u.clinic_id) : '-'}</td></tr>`).join('')}</tbody></table>
       <form class="inline-form" id="f-user"><input name="email" type="email" placeholder="メールアドレス" required><input name="name" placeholder="名前">
-        <select name="role">${isAdmin ? '<option value="admin">本部</option>' : ''}<option value="company_admin">会社管理者</option><option value="clinic_staff" selected>院担当者</option></select>
+        <select name="role">${isAdmin ? '<option value="admin">運営（自社）</option>' : ''}<option value="company_admin">会社管理者</option><option value="clinic_staff" selected>院担当者</option></select>
         ${isAdmin ? `<select name="company_id">${companyOpts}</select>` : ''}
         <select name="clinic_id">${m.clinics.map((c) => `<option value="${c.id}">${coName(c.company_id)} / ${esc(c.name)}</option>`).join('')}</select>
         <button class="btn">アカウントを追加</button></form></section>`;

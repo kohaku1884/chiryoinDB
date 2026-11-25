@@ -19,6 +19,9 @@ const notFound = (m = '見つかりません') => new HttpError(404, m);
 const ymRe = /^\d{4}-(0[1-9]|1[0-2])$/;
 const nextYm = (ym) => { const [y, m] = ym.split('-').map(Number); return m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`; };
 const curYm = () => new Date().toISOString().slice(0, 7);
+// 月が終わってから LOCK_MONTHS か月が過ぎると編集ロック（当月・翌月・翌々月は編集可）
+const LOCK_MONTHS = 2;
+const addYm = (ym, n) => { for (let i = 0; i < n; i++) ym = nextYm(ym); return ym; };
 
 export function createApp({ db, devLogin = true }) {
   const sessions = new Map(); // token -> email（本番は Google ログインの検証に置換）
@@ -45,6 +48,13 @@ export function createApp({ db, devLogin = true }) {
     `SELECT i.id,i.label FROM items i JOIN company_items ci ON ci.item_id=i.id
      WHERE ci.company_id=? ORDER BY i.id`, companyId);
 
+  // ---- 編集ロック ----
+  const isLocked = (clinicId, ym) => curYm() > addYm(ym, LOCK_MONTHS)
+    && !get('SELECT 1 FROM month_unlocks WHERE clinic_id=? AND ym=?', clinicId, ym);
+  const assertEditable = (clinicId, ym) => {
+    if (isLocked(clinicId, ym)) throw new HttpError(423, `${ym} は編集ロックされています。解除は運営にご依頼ください`);
+  };
+
   // ---- 月次シート ----
   // 既存患者（先月以前から継続）の月次レコードを、前月の内容をコピーして自動生成する
   function carryOver(clinicId, ym) {
@@ -54,14 +64,18 @@ export function createApp({ db, devLogin = true }) {
          AND NOT EXISTS (SELECT 1 FROM records r WHERE r.patient_id=p.id AND r.ym=?)`,
       clinicId, ym, ym, ym);
     for (const { id } of missing) {
-      const prev = get('SELECT visits,vals FROM records WHERE patient_id=? AND ym<? ORDER BY ym DESC LIMIT 1', id, ym);
-      run('INSERT INTO records(patient_id,ym,visits,vals,state) VALUES (?,?,?,?,?)',
-        id, ym, prev ? prev.visits : 0, prev ? prev.vals : '{}', 'pending');
+      // 項目の値は前月からコピー。当月の来院日数は毎月0から入力（累計は別に集計）
+      const prev = get('SELECT vals FROM records WHERE patient_id=? AND ym<? ORDER BY ym DESC LIMIT 1', id, ym);
+      run('INSERT INTO records(patient_id,ym,visits,vals,state) VALUES (?,?,0,?,?)',
+        id, ym, prev ? prev.vals : '{}', 'pending');
     }
   }
   function buildSheet(clinic, ym) {
     carryOver(clinic.id, ym);
     const items = enabledItems(clinic.company_id);
+    const cumulative = Object.fromEntries(all(
+      `SELECT r.patient_id AS id, SUM(r.visits) AS n FROM records r JOIN patients p ON p.id=r.patient_id
+       WHERE p.clinic_id=? AND r.ym<=? GROUP BY r.patient_id`, clinic.id, ym).map((x) => [x.id, x.n]));
     const rows = all(
       `SELECT r.id AS record_id, r.visits, r.vals, r.state, p.id AS patient_id, p.seq, p.name, p.birth, p.first_month
        FROM records r JOIN patients p ON p.id=r.patient_id
@@ -73,21 +87,21 @@ export function createApp({ db, devLogin = true }) {
       return {
         record_id: r.record_id, patient_id: r.patient_id,
         code: `C${clinic.company_id}-${String(r.seq).padStart(4, '0')}`,
-        name: r.name, birth: r.birth, visits: r.visits, vals: shown, total, state: r.state,
+        name: r.name, birth: r.birth, visits: r.visits, cumulative: cumulative[r.patient_id] || 0, vals: shown, total, state: r.state,
         isNew: r.first_month === ym,
       };
     });
     const sum = (list) => {
-      const t = { visits: 0, total: 0, vals: {} };
+      const t = { visits: 0, cumulative: 0, total: 0, vals: {} };
       for (const it of items) t.vals[it.id] = 0;
-      for (const r of list) { t.visits += r.visits; t.total += r.total; for (const it of items) t.vals[it.id] += r.vals[it.id]; }
+      for (const r of list) { t.visits += r.visits; t.cumulative += r.cumulative; t.total += r.total; for (const it of items) t.vals[it.id] += r.vals[it.id]; }
       return t;
     };
     const active = rows.filter((r) => r.state !== 'ended');
     const newP = rows.filter((r) => r.isNew);
     const existing = rows.filter((r) => !r.isNew);
     return {
-      clinic, ym, items, new: newP, existing,
+      clinic, ym, items, locked: isLocked(clinic.id, ym), past: curYm() > addYm(ym, LOCK_MONTHS), new: newP, existing,
       totals: { new: sum(newP.filter((r) => r.state !== 'ended')), existing: sum(existing.filter((r) => r.state !== 'ended')), all: sum(active) },
     };
   }
@@ -133,6 +147,7 @@ export function createApp({ db, devLogin = true }) {
     if (!name || name.length > 50) throw bad('氏名を入力してください（50文字以内）');
     if (birth && !/^\d{4}-\d{2}-\d{2}$/.test(birth)) throw bad('生年月日の形式が不正です');
     if (!ymRe.test(body.ym || '')) throw bad('年月の形式が不正です');
+    assertEditable(clinic.id, body.ym);
     // 会社内での重複チェック（氏名+生年月日）。force=true で承知の上登録
     const dup = get('SELECT id FROM patients WHERE company_id=? AND name=? AND birth=?', clinic.company_id, name, birth);
     if (dup && !body.force) throw new HttpError(409, '同じ氏名・生年月日の患者が既に登録されています（同一会社内）');
@@ -149,13 +164,14 @@ export function createApp({ db, devLogin = true }) {
   route('PUT', '/api/records/:id', ({ user, params, body }) => {
     requireAuth(user);
     const r = recordOf(user, params.id);
+    assertEditable(r.clinic_id, r.ym);
     if (r.state === 'ended') throw bad('終了した患者は編集できません');
     const allowed = new Set(enabledItems(r.company_id).map((i) => String(i.id)));
     const vals = JSON.parse(r.vals);
     let visits = r.visits;
     if (body.visits !== undefined) {
       visits = Number(body.visits);
-      if (!Number.isInteger(visits) || visits < 0 || visits > 999) throw bad('来院回数は0〜999の整数です');
+      if (!Number.isInteger(visits) || visits < 0 || visits > 31) throw bad('来院日数は0〜31の整数です');
     }
     for (const [k, v] of Object.entries(body.vals || {})) {
       if (!allowed.has(k)) throw bad('この会社では使用できない項目です');
@@ -172,12 +188,23 @@ export function createApp({ db, devLogin = true }) {
     requireAuth(user);
     const r = recordOf(user, params.id);
     if (!['confirmed', 'ended', 'pending'].includes(body.state)) throw bad('state が不正です');
+    assertEditable(r.clinic_id, r.ym);
     tx(() => {
       run('UPDATE records SET state=? WHERE id=?', body.state, r.id);
       run('UPDATE patients SET ended_month=? WHERE id=?', body.state === 'ended' ? r.ym : null, r.patient_id);
       // 終了を取り消した場合、それ以降の月に作られた自動コピーは破棄してやり直す
       if (body.state !== 'ended') run("DELETE FROM records WHERE patient_id=? AND ym>? AND state='pending'", r.patient_id, r.ym);
     });
+    return { ok: true };
+  });
+
+  // 運営(自社)のみ: 過去月のロック解除 / 再ロック
+  route('POST', '/api/lock', ({ user, body }) => {
+    if (requireAuth(user).role !== 'admin') throw forbidden();
+    const clinic = clinicOf(user, body.clinic_id);
+    if (!ymRe.test(body.ym || '')) throw bad('年月の形式が不正です');
+    if (body.locked) run('DELETE FROM month_unlocks WHERE clinic_id=? AND ym=?', clinic.id, body.ym);
+    else run('INSERT OR IGNORE INTO month_unlocks(clinic_id,ym) VALUES (?,?)', clinic.id, body.ym);
     return { ok: true };
   });
 

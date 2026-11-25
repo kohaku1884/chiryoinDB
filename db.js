@@ -11,7 +11,7 @@ export function openDb(file = process.env.DB_FILE || 'data.db') {
     CREATE TABLE IF NOT EXISTS clinics(
       id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
       name TEXT NOT NULL, manager TEXT NOT NULL DEFAULT '');
-    -- role: admin(本部) / company_admin(会社管理者) / clinic_staff(院担当者)
+    -- role: admin(運営=自社) / company_admin(会社管理者) / clinic_staff(院担当者)
     CREATE TABLE IF NOT EXISTS users(
       email TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL,
       company_id INTEGER REFERENCES companies(id),
@@ -37,6 +37,10 @@ export function openDb(file = process.env.DB_FILE || 'data.db') {
       ym TEXT NOT NULL, visits INTEGER NOT NULL DEFAULT 0,
       vals TEXT NOT NULL DEFAULT '{}', state TEXT NOT NULL DEFAULT 'pending',
       UNIQUE(patient_id, ym));
+    -- 運営が解除した過去月（行があればロックされない）
+    CREATE TABLE IF NOT EXISTS month_unlocks(
+      clinic_id INTEGER NOT NULL REFERENCES clinics(id), ym TEXT NOT NULL,
+      PRIMARY KEY(clinic_id, ym));
   `);
   return db;
 }
@@ -51,7 +55,7 @@ export function seed(db) {
   // 手書きメモの例: A社=項目1,2 / B社=項目1,3
   ins('INSERT INTO company_items VALUES (1,1),(1,2),(2,1),(2,3)');
   ins(`INSERT INTO users(email,name,role,company_id,clinic_id) VALUES
-    ('admin@example.com','本部 管理者','admin',NULL,NULL),
+    ('admin@example.com','運営 管理者','admin',NULL,NULL),
     ('a-admin@example.com','A社 管理者','company_admin',1,NULL),
     ('a1@example.com','A院 担当','clinic_staff',1,1),
     ('a2@example.com','A2院 担当','clinic_staff',1,2),

@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { openDb, seed } from './db.js';
 import { createApp } from './server.js';
 
+// 月はテスト実行日からの相対で決める（ロック期限を跨いでも壊れないように）
+const ymOf = (n) => { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + n); return d.toISOString().slice(0, 7); };
+const PREV = ymOf(-1), CUR = ymOf(0), NEXT = ymOf(1), OLD = ymOf(-4);
 const db = openDb(':memory:');
 seed(db);
 const server = createApp({ db });
@@ -28,8 +31,8 @@ test('未ログインは拒否', async () => {
 
 test('月次: 新規登録 → 翌月コピー → 終了 → 以降は非表示', async () => {
   const c = await client('a1@example.com');
-  assert.equal((await c('POST', '/api/patients', { clinic_id: 1, ym: '2026-10', name: '患者一', birth: '1980-01-01' })).status, 200);
-  let s = (await c('GET', '/api/sheet?clinic_id=1&ym=2026-10')).data;
+  assert.equal((await c('POST', '/api/patients', { clinic_id: 1, ym: `${PREV}`, name: '患者一', birth: '1980-01-01' })).status, 200);
+  let s = (await c('GET', `/api/sheet?clinic_id=1&ym=${PREV}`)).data;
   assert.equal(s.new.length, 1);
   assert.deepEqual(s.items.map((i) => i.label), ['項目1', '項目2']); // A社は項目1,2のみ
   assert.equal(s.new[0].code, 'C1-0001');
@@ -37,45 +40,46 @@ test('月次: 新規登録 → 翌月コピー → 終了 → 以降は非表示
   assert.equal((await c('PUT', `/api/records/${rid}`, { visits: 4, vals: { 1: 3000, 2: 500 } })).status, 200);
 
   // 翌月: 既存患者として前月内容がコピーされ、未確認
-  s = (await c('GET', '/api/sheet?clinic_id=1&ym=2026-11')).data;
+  s = (await c('GET', `/api/sheet?clinic_id=1&ym=${CUR}`)).data;
   assert.equal(s.new.length, 0);
   assert.equal(s.existing.length, 1);
   assert.equal(s.existing[0].state, 'pending');
-  assert.equal(s.existing[0].visits, 4);
+  assert.equal(s.existing[0].visits, 0); // 当月来院日数は0から
+  assert.equal(s.existing[0].cumulative, 4); // 累計は前月分を含む
   assert.equal(s.existing[0].total, 3500);
   assert.equal(s.totals.existing.total, 3500);
 
   // 終了 → 同月は表示(終了扱い・合計から除外)、翌々月は非表示
   await c('POST', `/api/records/${s.existing[0].record_id}/state`, { state: 'ended' });
-  s = (await c('GET', '/api/sheet?clinic_id=1&ym=2026-11')).data;
+  s = (await c('GET', `/api/sheet?clinic_id=1&ym=${CUR}`)).data;
   assert.equal(s.existing[0].state, 'ended');
   assert.equal(s.totals.existing.total, 0);
   assert.equal((await c('PUT', `/api/records/${s.existing[0].record_id}`, { visits: 1 })).status, 400);
-  s = (await c('GET', '/api/sheet?clinic_id=1&ym=2026-12')).data;
+  s = (await c('GET', `/api/sheet?clinic_id=1&ym=${NEXT}`)).data;
   assert.equal(s.existing.length, 0);
 });
 
 test('入力検証: 無効な項目・負数・計算値は受け付けない', async () => {
   const c = await client('a1@example.com');
-  await c('POST', '/api/patients', { clinic_id: 1, ym: '2026-11', name: '患者二' });
-  const s = (await c('GET', '/api/sheet?clinic_id=1&ym=2026-11')).data;
+  await c('POST', '/api/patients', { clinic_id: 1, ym: `${CUR}`, name: '患者二' });
+  const s = (await c('GET', `/api/sheet?clinic_id=1&ym=${CUR}`)).data;
   const rid = s.new[0].record_id;
   assert.equal((await c('PUT', `/api/records/${rid}`, { vals: { 3: 100 } })).status, 400); // A社に項目3は無い
   assert.equal((await c('PUT', `/api/records/${rid}`, { vals: { 1: -1 } })).status, 400);
   await c('PUT', `/api/records/${rid}`, { visits: 2, vals: { 1: 100 }, total: 99999 });
-  const s2 = (await c('GET', '/api/sheet?clinic_id=1&ym=2026-11')).data;
+  const s2 = (await c('GET', `/api/sheet?clinic_id=1&ym=${CUR}`)).data;
   assert.equal(s2.new.find((r) => r.record_id === rid).total, 100); // total は無視される
 });
 
 test('権限: 他院・他社は閲覧/編集不可', async () => {
   const a1 = await client('a1@example.com');
-  assert.equal((await a1('GET', '/api/sheet?clinic_id=2&ym=2026-11')).status, 403); // 同社の他院
-  assert.equal((await a1('GET', '/api/sheet?clinic_id=3&ym=2026-11')).status, 403); // 他社
+  assert.equal((await a1('GET', `/api/sheet?clinic_id=2&ym=${CUR}`)).status, 403); // 同社の他院
+  assert.equal((await a1('GET', `/api/sheet?clinic_id=3&ym=${CUR}`)).status, 403); // 他社
   assert.equal((await a1('GET', '/api/manage')).status, 403);
   const aa = await client('a-admin@example.com');
-  assert.equal((await aa('GET', '/api/sheet?clinic_id=2&ym=2026-11')).status, 200);
-  assert.equal((await aa('GET', '/api/sheet?clinic_id=3&ym=2026-11')).status, 403);
-  const rid = (await a1('GET', '/api/sheet?clinic_id=1&ym=2026-11')).data.new[0].record_id;
+  assert.equal((await aa('GET', `/api/sheet?clinic_id=2&ym=${CUR}`)).status, 200);
+  assert.equal((await aa('GET', `/api/sheet?clinic_id=3&ym=${CUR}`)).status, 403);
+  const rid = (await a1('GET', `/api/sheet?clinic_id=1&ym=${CUR}`)).data.new[0].record_id;
   const b1 = await client('b1@example.com');
   assert.equal((await b1('PUT', `/api/records/${rid}`, { visits: 9 })).status, 403);
   assert.equal((await b1('POST', '/api/records/' + rid + '/state', { state: 'ended' })).status, 403);
@@ -98,22 +102,22 @@ test('マスター更新は全社に反映 / 会社別の項目切替', async ()
   const ad = await client('admin@example.com');
   await ad('PUT', '/api/items/1', { label: '施術料' });
   const b1 = await client('b1@example.com');
-  let s = (await b1('GET', '/api/sheet?clinic_id=3&ym=2026-11')).data;
+  let s = (await b1('GET', `/api/sheet?clinic_id=3&ym=${CUR}`)).data;
   assert.deepEqual(s.items.map((i) => i.label), ['施術料', '項目3']);
   await ad('PUT', '/api/company-items', { company_id: 2, item_id: 4, enabled: true });
-  s = (await b1('GET', '/api/sheet?clinic_id=3&ym=2026-11')).data;
+  s = (await b1('GET', `/api/sheet?clinic_id=3&ym=${CUR}`)).data;
   assert.equal(s.items.length, 3);
 });
 
 test('同一会社内の重複登録は警告、会社が違えば別ID体系', async () => {
   const a1 = await client('a1@example.com');
-  await a1('POST', '/api/patients', { clinic_id: 1, ym: '2026-11', name: '重複', birth: '1990-05-05' });
-  assert.equal((await a1('POST', '/api/patients', { clinic_id: 1, ym: '2026-11', name: '重複', birth: '1990-05-05' })).status, 409);
+  await a1('POST', '/api/patients', { clinic_id: 1, ym: `${CUR}`, name: '重複', birth: '1990-05-05' });
+  assert.equal((await a1('POST', '/api/patients', { clinic_id: 1, ym: `${CUR}`, name: '重複', birth: '1990-05-05' })).status, 409);
   const a2 = await client('a2@example.com'); // 同社他院でも検出
-  assert.equal((await a2('POST', '/api/patients', { clinic_id: 2, ym: '2026-11', name: '重複', birth: '1990-05-05' })).status, 409);
+  assert.equal((await a2('POST', '/api/patients', { clinic_id: 2, ym: `${CUR}`, name: '重複', birth: '1990-05-05' })).status, 409);
   const b1 = await client('b1@example.com');
-  assert.equal((await b1('POST', '/api/patients', { clinic_id: 3, ym: '2026-11', name: '重複', birth: '1990-05-05' })).status, 200);
-  const s = (await b1('GET', '/api/sheet?clinic_id=3&ym=2026-11')).data;
+  assert.equal((await b1('POST', '/api/patients', { clinic_id: 3, ym: `${CUR}`, name: '重複', birth: '1990-05-05' })).status, 200);
+  const s = (await b1('GET', `/api/sheet?clinic_id=3&ym=${CUR}`)).data;
   assert.equal(s.new[0].code, 'C2-0001');
 });
 
@@ -121,4 +125,40 @@ test('不正な年月・先の月は拒否', async () => {
   const a1 = await client('a1@example.com');
   assert.equal((await a1('GET', '/api/sheet?clinic_id=1&ym=2026-13')).status, 400);
   assert.equal((await a1('GET', '/api/sheet?clinic_id=1&ym=2099-01')).status, 400);
+});
+
+test('累計来院日数は月をまたいで積み上がる', async () => {
+  const c = await client('b1@example.com');
+  await c('POST', '/api/patients', { clinic_id: 3, ym: PREV, name: '累計', birth: '1970-01-01' });
+  const rid = (await c('GET', `/api/sheet?clinic_id=3&ym=${PREV}`)).data.new.find((r) => r.name === '累計').record_id;
+  await c('PUT', `/api/records/${rid}`, { visits: 5 });
+  let row = (await c('GET', `/api/sheet?clinic_id=3&ym=${CUR}`)).data.existing.find((r) => r.name === '累計');
+  assert.equal(row.cumulative, 5);
+  await c('PUT', `/api/records/${row.record_id}`, { visits: 3 });
+  row = (await c('GET', `/api/sheet?clinic_id=3&ym=${CUR}`)).data.existing.find((r) => r.name === '累計');
+  assert.deepEqual([row.visits, row.cumulative], [3, 8]);
+  assert.equal((await c('PUT', `/api/records/${row.record_id}`, { visits: 32 })).status, 400);
+});
+
+test('2か月経過でロック、解除は運営のみ', async () => {
+  const a1 = await client('a1@example.com');
+  assert.equal((await a1('GET', `/api/sheet?clinic_id=1&ym=${ymOf(-2)}`)).data.locked, false); // 2か月前はまだ編集可
+  // 古い月に患者を直接作る（ロック判定の検証用）
+  db.prepare("INSERT INTO patients(company_id,clinic_id,seq,name,birth,first_month) VALUES (1,1,900,'古い','',?)").run(OLD);
+  const pid = db.prepare('SELECT id FROM patients WHERE seq=900').get().id;
+  const rid = db.prepare("INSERT INTO records(patient_id,ym,state) VALUES (?,?,'confirmed')").run(pid, OLD).lastInsertRowid;
+  const sheet = (await a1('GET', `/api/sheet?clinic_id=1&ym=${OLD}`)).data;
+  assert.equal(sheet.locked, true);
+  assert.equal((await a1('PUT', `/api/records/${rid}`, { visits: 1 })).status, 423);
+  assert.equal((await a1('POST', `/api/records/${rid}/state`, { state: 'ended' })).status, 423);
+  assert.equal((await a1('POST', '/api/patients', { clinic_id: 1, ym: OLD, name: '追加' })).status, 423);
+  // 会社管理者・院担当者は解除できない。運営だけが解除/再ロックできる
+  assert.equal((await a1('POST', '/api/lock', { clinic_id: 1, ym: OLD, locked: false })).status, 403);
+  const aa = await client('a-admin@example.com');
+  assert.equal((await aa('POST', '/api/lock', { clinic_id: 1, ym: OLD, locked: false })).status, 403);
+  const ad = await client('admin@example.com');
+  assert.equal((await ad('POST', '/api/lock', { clinic_id: 1, ym: OLD, locked: false })).status, 200);
+  assert.equal((await a1('PUT', `/api/records/${rid}`, { visits: 1 })).status, 200);
+  assert.equal((await ad('POST', '/api/lock', { clinic_id: 1, ym: OLD, locked: true })).status, 200);
+  assert.equal((await a1('PUT', `/api/records/${rid}`, { visits: 2 })).status, 423);
 });
