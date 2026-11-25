@@ -45,7 +45,7 @@ export function createApp({ db, devLogin = true }) {
     : u.role === 'company_admin' ? all('SELECT * FROM clinics WHERE company_id=? ORDER BY id', u.company_id)
     : all('SELECT * FROM clinics WHERE id=?', u.clinic_id);
   const enabledItems = (companyId) => all(
-    `SELECT i.id,i.label FROM items i JOIN company_items ci ON ci.item_id=i.id
+    `SELECT i.id,i.key,i.label,i.type FROM items i JOIN company_items ci ON ci.item_id=i.id
      WHERE ci.company_id=? ORDER BY i.id`, companyId);
 
   // ---- 編集ロック ----
@@ -55,59 +55,103 @@ export function createApp({ db, devLogin = true }) {
     if (isLocked(clinicId, ym)) throw new HttpError(423, `${ym} は編集ロックされています。解除は運営にご依頼ください`);
   };
 
+  // ---- 日付・値の検証 ----
+  const isDate = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(v)) && new Date(v).toISOString().slice(0, 10) === v;
+  const daysIn = (ym) => { const [y, m] = ym.split('-').map(Number); return new Date(y, m, 0).getDate(); };
+  const DAY_KEYS = ['d10', 'd15', 'd20', 'dend']; // 時点の順（後の時点ほど値は大きくなる）
+  const maxOf = (key, ym) => ({ d10: 10, d15: 15, d20: 20, dend: daysIn(ym), parts: 99 }[key] ?? 99_999_999);
+  const itemById = (list, id) => list.find((i) => String(i.id) === String(id));
+
+  // 入力値を検証して vals にマージする（数値は0以上の整数、チェックは0/1）
+  function mergeVals(items, vals, input, ym) {
+    for (const [id, raw] of Object.entries(input || {})) {
+      const it = itemById(items, id);
+      if (!it) throw bad('この会社では使用できない項目です');
+      if (it.type === 'check') {
+        if (raw !== true && raw !== false && raw !== 0 && raw !== 1) throw bad(`${it.label}の値が不正です`);
+        vals[it.id] = raw ? 1 : 0;
+      } else {
+        const n = Number(raw);
+        if (raw === '' || raw === null || !Number.isInteger(n) || n < 0) throw bad(`${it.label}は0以上の整数で入力してください`);
+        if (n > maxOf(it.key, ym)) throw bad(`${it.label}は${maxOf(it.key, ym).toLocaleString('ja-JP')}以下で入力してください`);
+        vals[it.id] = n;
+      }
+    }
+    // 通院日数: 後の時点の値が（入力済みで）前の時点より小さいのは不正
+    let prev = 0, prevLabel = '';
+    for (const key of DAY_KEYS) {
+      const it = items.find((i) => i.key === key);
+      if (!it) continue;
+      const v = Number(vals[it.id] || 0);
+      if (v > 0 && v < prev) throw bad(`${it.label}が${prevLabel}より少なくなっています`);
+      if (v > 0) { prev = v; prevLabel = it.label; }
+    }
+    return vals;
+  }
+
   // ---- 月次シート ----
-  // 既存患者（先月以前から継続）の月次レコードを、前月の内容をコピーして自動生成する
+  // 既存案件（先月以前から継続）の月次レコードを自動生成。引き継ぐのは carry=1 の項目（弁護士紹介済みなど）だけ。
+  // 通院日数・請求金額などは毎月0から入力する。
   function carryOver(clinicId, ym) {
+    const carryIds = all('SELECT id FROM items WHERE carry=1').map((i) => String(i.id));
     const missing = all(
-      `SELECT p.id FROM patients p
-       WHERE p.clinic_id=? AND p.first_month < ? AND (p.ended_month IS NULL OR p.ended_month >= ?)
-         AND NOT EXISTS (SELECT 1 FROM records r WHERE r.patient_id=p.id AND r.ym=?)`,
+      `SELECT c.id FROM cases c
+       WHERE c.clinic_id=? AND c.first_month < ? AND (c.ended_month IS NULL OR c.ended_month >= ?)
+         AND NOT EXISTS (SELECT 1 FROM records r WHERE r.case_id=c.id AND r.ym=?)`,
       clinicId, ym, ym, ym);
     for (const { id } of missing) {
-      // 項目の値は前月からコピー。当月の来院日数は毎月0から入力（累計は別に集計）
-      const prev = get('SELECT vals FROM records WHERE patient_id=? AND ym<? ORDER BY ym DESC LIMIT 1', id, ym);
-      run('INSERT INTO records(patient_id,ym,visits,vals,state) VALUES (?,?,0,?,?)',
-        id, ym, prev ? prev.vals : '{}', 'pending');
+      const prev = get('SELECT vals FROM records WHERE case_id=? AND ym<? ORDER BY ym DESC LIMIT 1', id, ym);
+      const pv = prev ? JSON.parse(prev.vals) : {};
+      const vals = {};
+      for (const k of carryIds) if (pv[k] !== undefined) vals[k] = pv[k];
+      run('INSERT INTO records(case_id,ym,vals,state) VALUES (?,?,?,?)', id, ym, JSON.stringify(vals), 'pending');
     }
   }
   function buildSheet(clinic, ym) {
     carryOver(clinic.id, ym);
     const items = enabledItems(clinic.company_id);
-    const cumulative = Object.fromEntries(all(
-      `SELECT r.patient_id AS id, SUM(r.visits) AS n FROM records r JOIN patients p ON p.id=r.patient_id
-       WHERE p.clinic_id=? AND r.ym<=? GROUP BY r.patient_id`, clinic.id, ym).map((x) => [x.id, x.n]));
+    const dend = items.find((i) => i.key === 'dend');
+    // 累計通院日数 = 事故案件ごとの「通院日数（末日）」の月次合計（この月まで）
+    const cumulative = {};
+    if (dend) {
+      for (const r of all(`SELECT r.case_id, r.vals FROM records r JOIN cases c ON c.id=r.case_id WHERE c.clinic_id=? AND r.ym<=?`, clinic.id, ym)) {
+        cumulative[r.case_id] = (cumulative[r.case_id] || 0) + Number(JSON.parse(r.vals)[dend.id] || 0);
+      }
+    }
+    const caseCount = Object.fromEntries(all('SELECT patient_id, COUNT(*) n FROM cases WHERE company_id=? GROUP BY patient_id', clinic.company_id).map((x) => [x.patient_id, x.n]));
     const rows = all(
-      `SELECT r.id AS record_id, r.visits, r.vals, r.state, p.id AS patient_id, p.seq, p.name, p.birth, p.first_month
-       FROM records r JOIN patients p ON p.id=r.patient_id
-       WHERE p.clinic_id=? AND r.ym=? ORDER BY p.seq`, clinic.id, ym).map((r) => {
+      `SELECT r.id AS record_id, r.vals, r.state, c.id AS case_id, c.case_no, c.accident_date, c.first_visit, c.first_month,
+              p.id AS patient_id, p.seq, p.name, p.birth
+       FROM records r JOIN cases c ON c.id=r.case_id JOIN patients p ON p.id=c.patient_id
+       WHERE c.clinic_id=? AND r.ym=? ORDER BY p.seq, c.case_no`, clinic.id, ym).map((r) => {
       const vals = JSON.parse(r.vals);
       const shown = {};
-      let total = 0;
-      for (const it of items) { shown[it.id] = Number(vals[it.id] || 0); total += shown[it.id]; }
+      for (const it of items) shown[it.id] = Number(vals[it.id] || 0);
       return {
-        record_id: r.record_id, patient_id: r.patient_id,
-        code: `C${clinic.company_id}-${String(r.seq).padStart(4, '0')}`,
-        name: r.name, birth: r.birth, visits: r.visits, cumulative: cumulative[r.patient_id] || 0, vals: shown, total, state: r.state,
-        isNew: r.first_month === ym,
+        record_id: r.record_id, case_id: r.case_id, patient_id: r.patient_id,
+        code: `C${clinic.company_id}-${String(r.seq).padStart(4, '0')}-${r.case_no}`,
+        name: r.name, birth: r.birth, accident_date: r.accident_date, first_visit: r.first_visit,
+        case_no: r.case_no, multi: caseCount[r.patient_id] > 1,
+        vals: shown, cumulative: cumulative[r.case_id] || 0, state: r.state, isNew: r.first_month === ym,
       };
     });
     const sum = (list) => {
-      const t = { visits: 0, cumulative: 0, total: 0, vals: {} };
+      const t = { cumulative: 0, vals: {} };
       for (const it of items) t.vals[it.id] = 0;
-      for (const r of list) { t.visits += r.visits; t.cumulative += r.cumulative; t.total += r.total; for (const it of items) t.vals[it.id] += r.vals[it.id]; }
+      for (const r of list) { t.cumulative += r.cumulative; for (const it of items) t.vals[it.id] += r.vals[it.id]; } // チェック項目は件数になる
       return t;
     };
-    const active = rows.filter((r) => r.state !== 'ended');
+    const live = (list) => list.filter((r) => r.state !== 'ended');
     const newP = rows.filter((r) => r.isNew);
     const existing = rows.filter((r) => !r.isNew);
     return {
       clinic, ym, items, locked: isLocked(clinic.id, ym), past: curYm() > addYm(ym, LOCK_MONTHS), new: newP, existing,
-      totals: { new: sum(newP.filter((r) => r.state !== 'ended')), existing: sum(existing.filter((r) => r.state !== 'ended')), all: sum(active) },
+      totals: { new: sum(live(newP)), existing: sum(live(existing)), all: sum(live(rows)) },
     };
   }
 
   function recordOf(u, id) {
-    const r = get(`SELECT r.*, p.clinic_id, p.company_id FROM records r JOIN patients p ON p.id=r.patient_id WHERE r.id=?`, Number(id));
+    const r = get(`SELECT r.*, c.clinic_id, c.company_id, c.patient_id FROM records r JOIN cases c ON c.id=r.case_id WHERE r.id=?`, Number(id));
     if (!r) throw notFound();
     clinicOf(u, r.clinic_id);
     return r;
@@ -139,51 +183,72 @@ export function createApp({ db, devLogin = true }) {
     return tx(() => buildSheet(clinic, ym));
   });
 
-  route('POST', '/api/patients', ({ user, body }) => {
+  function checkCaseDates(accident, firstVisit) {
+    if (!isDate(accident)) throw bad('事故日を正しく入力してください');
+    if (!isDate(firstVisit)) throw bad('初診日を正しく入力してください');
+    if (firstVisit < accident) throw bad('初診日が事故日より前になっています');
+  }
+
+  // 事故案件の登録。同じ氏名+生年月日の患者が会社内にいれば同一人物として、その人の事故として追加する
+  route('POST', '/api/cases', ({ user, body }) => {
     requireAuth(user);
     const clinic = clinicOf(user, body.clinic_id);
     const name = String(body.name || '').trim();
     const birth = String(body.birth || '');
     if (!name || name.length > 50) throw bad('氏名を入力してください（50文字以内）');
-    if (birth && !/^\d{4}-\d{2}-\d{2}$/.test(birth)) throw bad('生年月日の形式が不正です');
+    if (!isDate(birth)) throw bad('生年月日を正しく入力してください');
     if (!ymRe.test(body.ym || '')) throw bad('年月の形式が不正です');
     assertEditable(clinic.id, body.ym);
-    // 会社内での重複チェック（氏名+生年月日）。force=true で承知の上登録
-    const dup = get('SELECT id FROM patients WHERE company_id=? AND name=? AND birth=?', clinic.company_id, name, birth);
-    if (dup && !body.force) throw new HttpError(409, '同じ氏名・生年月日の患者が既に登録されています（同一会社内）');
+    checkCaseDates(body.accident_date, body.first_visit);
+    if (body.first_visit.slice(0, 7) > body.ym) throw bad('初診日がこの月より後になっています');
     return tx(() => {
-      const seq = get('SELECT COALESCE(MAX(seq),0)+1 s FROM patients WHERE company_id=?', clinic.company_id).s;
-      const pid = run('INSERT INTO patients(company_id,clinic_id,seq,name,birth,first_month) VALUES (?,?,?,?,?,?)',
-        clinic.company_id, clinic.id, seq, name, birth, body.ym).lastInsertRowid;
-      run('INSERT INTO records(patient_id,ym,state) VALUES (?,?,?)', pid, body.ym, 'confirmed');
-      return { ok: true };
+      let p = get('SELECT * FROM patients WHERE company_id=? AND name=? AND birth=?', clinic.company_id, name, birth);
+      const existingPatient = !!p;
+      if (!p) {
+        const seq = get('SELECT COALESCE(MAX(seq),0)+1 s FROM patients WHERE company_id=?', clinic.company_id).s;
+        const id = run('INSERT INTO patients(company_id,seq,name,birth) VALUES (?,?,?,?)', clinic.company_id, seq, name, birth).lastInsertRowid;
+        p = { id };
+      } else if (get('SELECT 1 FROM cases WHERE patient_id=? AND accident_date=?', p.id, body.accident_date)) {
+        throw new HttpError(409, '同じ患者・同じ事故日の案件が既に登録されています');
+      }
+      const caseNo = get('SELECT COALESCE(MAX(case_no),0)+1 n FROM cases WHERE patient_id=?', p.id).n;
+      const cid = run(`INSERT INTO cases(patient_id,company_id,clinic_id,case_no,accident_date,first_visit,first_month) VALUES (?,?,?,?,?,?,?)`,
+        p.id, clinic.company_id, clinic.id, caseNo, body.accident_date, body.first_visit, body.ym).lastInsertRowid;
+      run('INSERT INTO records(case_id,ym,state) VALUES (?,?,?)', cid, body.ym, 'confirmed');
+      return { ok: true, existing_patient: existingPatient, case_no: caseNo };
     });
   });
 
-  // 編集できるのは visits と有効な項目の数値のみ（合計などの計算値は受け付けない）
+  // 事故日・初診日の修正（入力ミスの訂正用）
+  route('PUT', '/api/cases/:id', ({ user, params, body }) => {
+    requireAuth(user);
+    const c = get('SELECT * FROM cases WHERE id=?', Number(params.id));
+    if (!c) throw notFound();
+    clinicOf(user, c.clinic_id);
+    if (!ymRe.test(body.ym || '')) throw bad('年月の形式が不正です');
+    assertEditable(c.clinic_id, body.ym);
+    const accident = body.accident_date ?? c.accident_date;
+    const firstVisit = body.first_visit ?? c.first_visit;
+    checkCaseDates(accident, firstVisit);
+    if (get('SELECT 1 FROM cases WHERE patient_id=? AND accident_date=? AND id<>?', c.patient_id, accident, c.id)) {
+      throw new HttpError(409, '同じ患者・同じ事故日の案件が既に登録されています');
+    }
+    run('UPDATE cases SET accident_date=?, first_visit=? WHERE id=?', accident, firstVisit, c.id);
+    return { ok: true };
+  });
+
+  // 編集できるのは有効な項目の値だけ（累計などの計算値は受け付けない）
   route('PUT', '/api/records/:id', ({ user, params, body }) => {
     requireAuth(user);
     const r = recordOf(user, params.id);
     assertEditable(r.clinic_id, r.ym);
-    if (r.state === 'ended') throw bad('終了した患者は編集できません');
-    const allowed = new Set(enabledItems(r.company_id).map((i) => String(i.id)));
-    const vals = JSON.parse(r.vals);
-    let visits = r.visits;
-    if (body.visits !== undefined) {
-      visits = Number(body.visits);
-      if (!Number.isInteger(visits) || visits < 0 || visits > 31) throw bad('来院日数は0〜31の整数です');
-    }
-    for (const [k, v] of Object.entries(body.vals || {})) {
-      if (!allowed.has(k)) throw bad('この会社では使用できない項目です');
-      const n = Number(v);
-      if (!Number.isFinite(n) || n < 0 || n > 99999999) throw bad('数値が不正です');
-      vals[k] = n;
-    }
-    run('UPDATE records SET visits=?, vals=? WHERE id=?', visits, JSON.stringify(vals), r.id);
+    if (r.state === 'ended') throw bad('終了した案件は編集できません');
+    const vals = mergeVals(enabledItems(r.company_id), JSON.parse(r.vals), body.vals, r.ym);
+    run('UPDATE records SET vals=? WHERE id=?', JSON.stringify(vals), r.id);
     return { ok: true };
   });
 
-  // 既存患者の継続確認 / 終了 / 取消
+  // 既存案件の継続確認 / 終了 / 取消
   route('POST', '/api/records/:id/state', ({ user, params, body }) => {
     requireAuth(user);
     const r = recordOf(user, params.id);
@@ -191,9 +256,9 @@ export function createApp({ db, devLogin = true }) {
     assertEditable(r.clinic_id, r.ym);
     tx(() => {
       run('UPDATE records SET state=? WHERE id=?', body.state, r.id);
-      run('UPDATE patients SET ended_month=? WHERE id=?', body.state === 'ended' ? r.ym : null, r.patient_id);
+      run('UPDATE cases SET ended_month=? WHERE id=?', body.state === 'ended' ? r.ym : null, r.case_id);
       // 終了を取り消した場合、それ以降の月に作られた自動コピーは破棄してやり直す
-      if (body.state !== 'ended') run("DELETE FROM records WHERE patient_id=? AND ym>? AND state='pending'", r.patient_id, r.ym);
+      if (body.state !== 'ended') run("DELETE FROM records WHERE case_id=? AND ym>? AND state='pending'", r.case_id, r.ym);
     });
     return { ok: true };
   });
@@ -273,7 +338,8 @@ export function createApp({ db, devLogin = true }) {
     if (requireAuth(user).role !== 'admin') throw forbidden();
     const label = String(body.label || '').trim();
     if (!label) throw bad('項目名を入力してください');
-    return { id: run('INSERT INTO items(label) VALUES (?)', label).lastInsertRowid };
+    const type = body.type === 'check' ? 'check' : 'number';
+    return { id: run('INSERT INTO items(label,type,carry) VALUES (?,?,0)', label, type).lastInsertRowid };
   });
   route('PUT', '/api/items/:id', ({ user, params, body }) => {
     if (requireAuth(user).role !== 'admin') throw forbidden();

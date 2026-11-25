@@ -37,8 +37,9 @@ async function renderLogin() {
   });
 }
 
-async function loadSheet() {
-  S.error = '';
+async function loadSheet(error = null, info = '') {
+  S.error = error || '';
+  S.info = info;
   S.sheet = null;
   if (S.clinicId) {
     try { S.sheet = await api('GET', `/api/sheet?clinic_id=${S.clinicId}&ym=${S.ym}`); }
@@ -77,6 +78,7 @@ function renderSheet() {
       <button class="ghost" id="next">▶</button>
     </div>
     <div class="err" id="err">${esc(S.error)}</div>
+    ${S.info ? `<div class="note">${esc(S.info)}</div>` : ''}
     ${sh ? sheetHtml(sh) : ''}`;
   document.getElementById('clinic').onchange = (e) => { S.clinicId = Number(e.target.value); loadSheet(); };
   document.getElementById('ym').onchange = (e) => { if (e.target.value) { S.ym = e.target.value; loadSheet(); } };
@@ -85,8 +87,11 @@ function renderSheet() {
   if (!sh) return;
   const fail = (e) => { document.getElementById('err').textContent = e.message; };
   main.querySelectorAll('input[data-rec]').forEach((inp) => inp.onchange = async () => {
-    const body = inp.dataset.item ? { vals: { [inp.dataset.item]: inp.value } } : { visits: inp.value };
-    try { await api('PUT', `/api/records/${inp.dataset.rec}`, body); await loadSheet(); } catch (e) { fail(e); }
+    const value = inp.type === 'checkbox' ? inp.checked : inp.value;
+    try { await api('PUT', `/api/records/${inp.dataset.rec}`, { vals: { [inp.dataset.item]: value } }); await loadSheet(); } catch (e) { fail(e); await loadSheet(e.message); }
+  });
+  main.querySelectorAll('input[data-case]').forEach((inp) => inp.onchange = async () => {
+    try { await api('PUT', `/api/cases/${inp.dataset.case}`, { ym: S.ym, [inp.dataset.field]: inp.value }); await loadSheet(); } catch (e) { await loadSheet(e.message); }
   });
   main.querySelectorAll('button[data-state]').forEach((b) => b.onclick = async () => {
     try { await api('POST', `/api/records/${b.dataset.rec}/state`, { state: b.dataset.state }); await loadSheet(); } catch (e) { fail(e); }
@@ -97,50 +102,61 @@ function renderSheet() {
   const form = document.getElementById('add');
   if (form) form.onsubmit = async (ev) => {
     ev.preventDefault();
-    const body = { clinic_id: S.clinicId, ym: S.ym, name: form.name.value, birth: form.birth.value };
+    const body = { clinic_id: S.clinicId, ym: S.ym, name: form.name.value, birth: form.birth.value, accident_date: form.accident_date.value, first_visit: form.first_visit.value };
     try {
-      try { await api('POST', '/api/patients', body); }
-      catch (e) { if (e.status === 409 && confirm(`${e.message}\n別人として登録しますか？`)) await api('POST', '/api/patients', { ...body, force: true }); else throw e; }
-      await loadSheet();
+      const r = await api('POST', '/api/cases', body);
+      await loadSheet(null, r.existing_patient ? `既存の患者「${body.name}」に、${r.case_no}件目の事故として追加しました` : '');
     } catch (e) { fail(e); }
   };
 }
 
+const DAY_MAX = { d10: 10, d15: 15, d20: 20, dend: 31, parts: 99 };
 function sheetHtml(sh) {
-  const head = `<th>ID</th><th>氏名</th><th>生年月日</th><th class="num">来院日数（当月）</th><th class="num">来院日数（累計）</th>
-    ${sh.items.map((i) => `<th class="num">${esc(i.label)}</th>`).join('')}<th class="num">合計</th>`;
+  const showCum = sh.items.some((i) => i.key === 'dend');
+  const head = `<th>ID</th><th>氏名</th><th>生年月日</th><th>事故日</th><th>初診日</th>
+    ${sh.items.map((i) => `<th class="${i.type === 'check' ? 'chk' : 'num'}">${esc(i.label)}</th>`).join('')}${showCum ? '<th class="num">累計通院日数</th>' : ''}`;
   const row = (r, existing) => {
     const ended = r.state === 'ended';
     const ro = ended || sh.locked; // 終了済み・ロック中は入力不可
-    const cell = (extra, v) => ro ? `<td class="num">${v}</td>` : `<td class="num"><input type="number" min="0" ${extra} value="${v}"></td>`;
-    return `<tr class="${ended ? 'ended' : ''}"><td>${esc(r.code)}</td><td>${esc(r.name)}</td><td>${esc(r.birth)}</td>
-      ${cell(`step="1" max="31" data-rec="${r.record_id}"`, r.visits)}
-      <td class="calc">${r.cumulative}</td>
-      ${sh.items.map((i) => cell(`data-rec="${r.record_id}" data-item="${i.id}"`, r.vals[i.id])).join('')}
-      <td class="calc">${yen(r.total)}</td>
+    const date = (field, v) => ro ? `<td>${esc(v)}</td>` : `<td><input type="date" data-case="${r.case_id}" data-field="${field}" value="${esc(v)}"></td>`;
+    const cell = (i) => {
+      const v = r.vals[i.id], at = `data-rec="${r.record_id}" data-item="${i.id}"`;
+      if (i.type === 'check') return `<td class="chk"><input type="checkbox" ${at} ${v ? 'checked' : ''} ${ro ? 'disabled' : ''} aria-label="${esc(i.label)}"></td>`;
+      return ro ? `<td class="num">${yen(v)}</td>` : `<td class="num"><input type="number" min="0" step="1" ${DAY_MAX[i.key] ? `max="${DAY_MAX[i.key]}"` : ''} ${at} value="${v}"></td>`;
+    };
+    return `<tr class="${ended ? 'ended' : ''}"><td>${esc(r.code)}</td><td>${esc(r.name)}${r.multi ? ` <span class="tag ended">事故${r.case_no}件目</span>` : ''}</td><td>${esc(r.birth)}</td>
+      ${date('accident_date', r.accident_date)}${date('first_visit', r.first_visit)}
+      ${sh.items.map(cell).join('')}
+      ${showCum ? `<td class="calc">${r.cumulative}</td>` : ''}
       ${existing ? `<td><span class="tag ${r.state}">${{ pending: '未確認', confirmed: '継続', ended: '終了' }[r.state]}</span></td>
         <td>${sh.locked ? '' : ended ? `<button class="ghost" data-rec="${r.record_id}" data-state="pending">終了を取消</button>`
           : `${r.state === 'pending' ? `<button class="btn" data-rec="${r.record_id}" data-state="confirmed">継続</button> ` : ''}<button class="ghost danger" data-rec="${r.record_id}" data-state="ended">終了</button>`}</td>` : ''}
     </tr>`;
   };
-  const sumRow = (label, t, extraCols) => `<tr class="sum"><td colspan="3">${label}</td><td class="num">${t.visits}</td><td class="num">${t.cumulative}</td>
-    ${sh.items.map((i) => `<td class="num">${yen(t.vals[i.id])}</td>`).join('')}<td class="num"><b>${yen(t.total)}</b></td>${extraCols}</tr>`;
+  // 合計行: 数値項目は合計、チェック項目は件数
+  const sumRow = (label, t, extraCols) => `<tr class="sum"><td colspan="5">${label}</td>
+    ${sh.items.map((i) => `<td class="${i.type === 'check' ? 'chk' : 'num'}">${i.type === 'check' ? `${t.vals[i.id]}件` : yen(t.vals[i.id])}</td>`).join('')}${showCum ? `<td class="num">${t.cumulative}</td>` : ''}${extraCols}</tr>`;
   const pendingCount = sh.existing.filter((r) => r.state === 'pending').length;
   const lockBar = sh.locked
     ? `<div class="note">この月は編集ロック中です（月が終わって2か月経過）。${S.me.role === 'admin' ? `<button class="ghost" data-lock="0">ロックを解除</button>` : '修正が必要な場合は運営にご連絡ください。'}</div>`
     : (S.me.role === 'admin' && sh.past ? `<div class="note">この月は運営によりロック解除中です。<button class="ghost" data-lock="1">再ロック</button></div>` : '');
   return `${lockBar}
-    <section class="card"><h2>新規患者（今月から通院）</h2><p class="sub">${esc(sh.clinic.name)} ／ ${esc(sh.ym)}</p>
-      ${sh.new.length ? `<table><thead><tr>${head}</tr></thead><tbody>${sh.new.map((r) => row(r, false)).join('')}${sumRow('小計', sh.totals.new, '')}</tbody></table>` : '<div class="empty">新規患者はいません</div>'}
-      ${sh.locked ? '' : `<form id="add" class="inline-form"><input name="name" placeholder="氏名" required maxlength="50"><input name="birth" type="date" title="生年月日">
-        <button class="btn">新規患者を追加</button></form>`}
+    <section class="card"><h2>新規案件（今月から通院）</h2><p class="sub">${esc(sh.clinic.name)} ／ ${esc(sh.ym)}</p>
+      ${sh.new.length ? `<table><thead><tr>${head}</tr></thead><tbody>${sh.new.map((r) => row(r, false)).join('')}${sumRow('小計', sh.totals.new, '')}</tbody></table>` : '<div class="empty">新規の案件はありません</div>'}
+      ${sh.locked ? '' : `<form id="add" class="inline-form">
+        <input name="name" placeholder="氏名" aria-label="氏名" required maxlength="50">
+        <label class="f">生年月日<input name="birth" type="date" required></label>
+        <label class="f">事故日<input name="accident_date" type="date" required></label>
+        <label class="f">初診日<input name="first_visit" type="date" required></label>
+        <button class="btn">案件を追加</button></form>
+      <p class="sub">同じ氏名・生年月日の患者がいる場合は同一人物として、その人の新しい事故として追加されます。</p>`}
     </section>
-    <section class="card"><h2>既存患者（先月以前から継続）</h2>
-      <p class="sub">項目の値は前月の内容をコピーして表示しています（来院日数は毎月0から入力、累計は自動集計）。通院を続けている患者は「継続」、通院をやめた患者は「終了」を押してください。</p>
-      ${pendingCount ? `<div class="note">未確認の患者が ${pendingCount} 名います</div>` : ''}
-      ${sh.existing.length ? `<table><thead><tr>${head}<th>状態</th><th></th></tr></thead><tbody>${sh.existing.map((r) => row(r, true)).join('')}${sumRow('小計（終了を除く）', sh.totals.existing, '<td></td><td></td>')}</tbody></table>` : '<div class="empty">既存患者はいません</div>'}
+    <section class="card"><h2>既存案件（先月以前から継続）</h2>
+      <p class="sub">通院日数・請求金額・請求部位数は毎月0から入力します（累計通院日数は自動集計）。弁護士紹介済みは前月の状態を引き継ぎます。通院を続けている案件は「継続」、通院をやめた案件は「終了」を押してください。</p>
+      ${pendingCount ? `<div class="note">未確認の案件が ${pendingCount} 名います</div>` : ''}
+      ${sh.existing.length ? `<table><thead><tr>${head}<th>状態</th><th></th></tr></thead><tbody>${sh.existing.map((r) => row(r, true)).join('')}${sumRow('小計（終了を除く）', sh.totals.existing, '<td></td><td></td>')}</tbody></table>` : '<div class="empty">既存の案件はありません</div>'}
     </section>
-    <section class="card"><h2>院合計</h2><table><thead><tr><th colspan="3"></th><th class="num">来院日数（当月）</th><th class="num">来院日数（累計）</th>${sh.items.map((i) => `<th class="num">${esc(i.label)}</th>`).join('')}<th class="num">合計</th></tr></thead>
+    <section class="card"><h2>院合計</h2><table><thead><tr><th colspan="5"></th>${sh.items.map((i) => `<th class="${i.type === 'check' ? 'chk' : 'num'}">${esc(i.label)}</th>`).join('')}${showCum ? '<th class="num">累計通院日数</th>' : ''}</tr></thead>
       <tbody>${sumRow('新規 + 既存（終了を除く）', sh.totals.all, '')}</tbody></table></section>`;
 }
 
@@ -156,10 +172,10 @@ function renderManage() {
     <div class="err" id="err"></div>
     ${isAdmin ? `<section class="card"><h2>マスター項目</h2><p class="sub">名称を変更すると全社に反映されます。会社ごとの使用可否はチェックで設定します。</p>
       <table><thead><tr><th>項目</th>${m.companies.map((c) => `<th>${esc(c.name)}</th>`).join('')}</tr></thead><tbody>
-      ${m.items.map((i) => `<tr><td><input data-item-label="${i.id}" value="${esc(i.label)}"></td>
+      ${m.items.map((i) => `<tr><td><input data-item-label="${i.id}" value="${esc(i.label)}"> <span class="tag ended">${i.type === 'check' ? 'チェック' : '数値'}</span></td>
         ${m.companies.map((c) => `<td><input type="checkbox" data-ci="${c.id}:${i.id}" ${m.company_items.some((x) => x.company_id === c.id && x.item_id === i.id) ? 'checked' : ''}></td>`).join('')}</tr>`).join('')}
       </tbody></table>
-      <form class="inline-form" id="f-item"><input name="label" placeholder="新しい項目名" required><button class="btn">項目を追加</button></form></section>` : ''}
+      <form class="inline-form" id="f-item"><input name="label" placeholder="新しい項目名" required><select name="type"><option value="number">数値</option><option value="check">チェック</option></select><button class="btn">項目を追加</button></form></section>` : ''}
     <div class="grid">
       ${isAdmin ? `<section class="card"><h2>会社</h2><table><tbody>${m.companies.map((c) => `<tr><td>${esc(c.name)}</td></tr>`).join('')}</tbody></table>
         <form class="inline-form" id="f-company"><input name="name" placeholder="会社名" required><button class="btn">会社を追加</button></form></section>` : ''}

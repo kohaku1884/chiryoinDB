@@ -46,3 +46,8 @@ tr.ended td.calc { text-decoration: line-through; }
 .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
 .inline-form { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .note { background: var(--warn-bg); color: var(--warn); padding: 8px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 12px; }
+td.chk, th.chk { text-align: center; }
+td input[type=checkbox] { width: 18px; height: 18px; }
+td input[type=date] { width: 140px; }
+label.f { display: inline-flex; flex-direction: column; font-size: 12px; color: var(--muted); }
+td input[type=number] { width: 80px; }
